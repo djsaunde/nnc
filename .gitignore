@@ -1,0 +1,16 @@
+# Build outputs
+build/
+*.o
+*.obj
+*.d
+
+# Generated datasets / downloads
+datasets/
+
+# IDE and editor files
+.vscode/
+*.swp
+*.swo
+*.tmp
+*.log
+.DS_Store
