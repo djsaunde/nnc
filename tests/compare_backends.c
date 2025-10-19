@@ -54,16 +54,19 @@ int main(void)
 
     srand(1234);
     Network *cpu = nn_create_mlp(input_size, hidden_size, output_size, ACT_RELU, ACT_SOFTMAX,
-                                  0.0, BACKEND_CPU);
+                                 0.0, BACKEND_CPU);
 
     srand(1234);
     Network *gpu = nn_create_mlp(input_size, hidden_size, output_size, ACT_RELU, ACT_SOFTMAX,
-                                  0.0, BACKEND_GPU);
+                                 0.0, BACKEND_GPU);
 
     if (gpu == NULL) {
         fprintf(stderr, "Failed to create GPU backend network.\n");
         return 1;
     }
+
+    nn_set_optimizer(cpu, OPTIMIZER_SGD, 0.9f, 0.999f, 1e-8f, 0.0f);
+    nn_set_optimizer(gpu, OPTIMIZER_SGD, 0.9f, 0.999f, 1e-8f, 0.0f);
 
     Matrix *input = create_random_matrix(input_size, batch);
     Matrix *target = create_random_matrix(output_size, batch);

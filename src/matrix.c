@@ -15,6 +15,9 @@ Matrix *matrix_create(int rows, int cols)
 
 void matrix_free(Matrix *m)
 {
+    if (m == NULL) {
+        return;
+    }
     free(m->data);
     free(m);
 }

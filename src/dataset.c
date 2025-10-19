@@ -47,12 +47,7 @@ Dataset *dataset_create_xor(void)
         return NULL;
     }
 
-    nn_float inputs[4][2] = {
-        {0.0f, 0.0f},
-        {0.0f, 1.0f},
-        {1.0f, 0.0f},
-        {1.0f, 1.0f}
-    };
+    nn_float inputs[4][2] = {{0.0f, 0.0f}, {0.0f, 1.0f}, {1.0f, 0.0f}, {1.0f, 1.0f}};
     nn_float outputs[4] = {0.0f, 1.0f, 1.0f, 0.0f};
 
     memcpy(data->inputs, inputs, sizeof(inputs));
@@ -104,8 +99,8 @@ Dataset *dataset_load_mnist(const char *images_path, const char *labels_path, in
     uint32_t magic_labels = read_be_u32(labels, &ok);
     uint32_t label_count = read_be_u32(labels, &ok);
 
-    if (!ok || magic_images != 2051 || magic_labels != 2049 || image_count != label_count ||
-        rows == 0 || cols == 0) {
+    if (!ok || magic_images != 2051 || magic_labels != 2049 ||
+        image_count != label_count || rows == 0 || cols == 0) {
         fclose(images);
         fclose(labels);
         return NULL;
@@ -235,7 +230,8 @@ void dataset_fill_sample_column(const Dataset *dataset, int index, Matrix *input
     return;
 }
 
-int dataset_fill_sample(const Dataset *dataset, int index, Matrix *input, Matrix *target)
+int dataset_fill_sample(const Dataset *dataset, int index, Matrix *input,
+                        Matrix *target)
 {
     if (input == NULL || target == NULL || input->cols != 1 || target->cols != 1) {
         return 0;
