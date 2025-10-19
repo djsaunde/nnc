@@ -42,7 +42,7 @@ static void print_usage(const char *prog)
         "  --train-labels PATH   MNIST training labels (default: %s)\n"
         "  --test-images PATH    MNIST test images for final evaluation (default: %s)\n"
         "  --test-labels PATH    MNIST test labels for final evaluation (default: %s)\n"
-        "  --limit N             Limit number of training samples (default: 10000)\n"
+        "  --limit N             Limit number of training samples (default: 60000)\n"
         "  --test-limit N        Limit number of test samples (default: all)\n"
         "  --epochs N            Training epochs (default: 5)\n"
         "  --batch-size N        Mini-batch size (default: 64)\n"
@@ -372,7 +372,7 @@ int main(int argc, char **argv)
         .train_labels = DEFAULT_MNIST_TRAIN_LABELS,
         .test_images = DEFAULT_MNIST_TEST_IMAGES,
         .test_labels = DEFAULT_MNIST_TEST_LABELS,
-        .limit = 10000,
+        .limit = 60000,
         .test_limit = -1,
         .epochs = 5,
         .batch_size = 64,

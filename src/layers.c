@@ -1460,6 +1460,7 @@ Layer *layer_batchnorm_create_backend(BackendKind backend, int channels, int spa
         CUDA_CALL(cudaMemset(data->d_m_beta, 0, bytes));
         CUDA_CALL(cudaMemset(data->d_v_beta, 0, bytes));
         data->gpu_capacity = 0;
+        data->adam_device_initialized = 1;
     }
 #else
     if (backend == BACKEND_GPU) {
@@ -1510,6 +1511,18 @@ void batchnorm_layer_gpu_copy_params_to_device(BatchNormLayerData *data)
                          cudaMemcpyHostToDevice));
     CUDA_CALL(cudaMemcpy(data->d_beta, data->beta->data, bytes,
                          cudaMemcpyHostToDevice));
+}
+
+void batchnorm_layer_gpu_copy_params_to_host(BatchNormLayerData *data)
+{
+    if (data == NULL || data->backend != BACKEND_GPU) {
+        return;
+    }
+    size_t bytes = (size_t) data->channels * sizeof(nn_float);
+    CUDA_CALL(cudaMemcpy(data->gamma->data, data->d_gamma, bytes,
+                         cudaMemcpyDeviceToHost));
+    CUDA_CALL(cudaMemcpy(data->beta->data, data->d_beta, bytes,
+                         cudaMemcpyDeviceToHost));
 }
 
 void batchnorm_layer_gpu_copy_running_to_device(BatchNormLayerData *data)
@@ -1574,6 +1587,17 @@ void batchnorm_layer_apply_sgd(BatchNormLayerData *data, nn_float learning_rate,
     if (data == NULL) {
         return;
     }
+#ifdef USE_CUDA
+    if (data->backend == BACKEND_GPU) {
+        batchnorm_gpu_apply_sgd(data->d_gamma, data->d_beta, data->d_grad_gamma,
+                                data->d_grad_beta, data->channels, learning_rate,
+                                weight_decay, grad_scale);
+        matrix_zero(data->grad_gamma);
+        matrix_zero(data->grad_beta);
+        batchnorm_layer_gpu_copy_params_to_host(data);
+        return;
+    }
+#endif
     int channels = data->channels;
     nn_float *gamma = data->gamma->data;
     nn_float *beta = data->beta->data;
@@ -1592,12 +1616,6 @@ void batchnorm_layer_apply_sgd(BatchNormLayerData *data, nn_float learning_rate,
 
     matrix_zero(data->grad_gamma);
     matrix_zero(data->grad_beta);
-#ifdef USE_CUDA
-    if (data->backend == BACKEND_GPU) {
-        batchnorm_layer_gpu_copy_params_to_device(data);
-        batchnorm_gpu_zero_gradients(data->d_grad_gamma, data->d_grad_beta, data->channels);
-    }
-#endif
 }
 
 void batchnorm_layer_apply_adamw(BatchNormLayerData *data, const OptimizerState *opt,
@@ -1607,6 +1625,30 @@ void batchnorm_layer_apply_adamw(BatchNormLayerData *data, const OptimizerState 
     if (data == NULL) {
         return;
     }
+
+#ifdef USE_CUDA
+    if (data->backend == BACKEND_GPU) {
+        if (!data->adam_device_initialized) {
+            size_t bytes = (size_t) data->channels * sizeof(nn_float);
+            CUDA_CALL(cudaMemset(data->d_m_gamma, 0, bytes));
+            CUDA_CALL(cudaMemset(data->d_v_gamma, 0, bytes));
+            CUDA_CALL(cudaMemset(data->d_m_beta, 0, bytes));
+            CUDA_CALL(cudaMemset(data->d_v_beta, 0, bytes));
+            data->adam_device_initialized = 1;
+        }
+        batchnorm_gpu_apply_adamw(data->d_gamma, data->d_beta, data->d_grad_gamma,
+                                   data->d_grad_beta, data->d_m_gamma, data->d_v_gamma,
+                                   data->d_m_beta, data->d_v_beta, data->channels,
+                                   learning_rate, opt->beta1, opt->beta2, opt->epsilon,
+                                   opt->weight_decay, inv_bias_correction1,
+                                   inv_bias_correction2, grad_scale);
+        matrix_zero(data->grad_gamma);
+        matrix_zero(data->grad_beta);
+        data->adam_initialized = 1;
+        batchnorm_layer_gpu_copy_params_to_host(data);
+        return;
+    }
+#endif
 
     int channels = data->channels;
     data->adam_m_gamma = ensure_matrix(data->adam_m_gamma, channels, 1);
@@ -1666,29 +1708,6 @@ void batchnorm_layer_apply_adamw(BatchNormLayerData *data, const OptimizerState 
 
     matrix_zero(data->grad_gamma);
     matrix_zero(data->grad_beta);
-#ifdef USE_CUDA
-    if (data->backend == BACKEND_GPU) {
-        size_t bytes = (size_t) data->channels * sizeof(nn_float);
-        batchnorm_layer_gpu_copy_params_to_device(data);
-        if (data->d_m_gamma != NULL && data->adam_m_gamma != NULL) {
-            CUDA_CALL(cudaMemcpy(data->d_m_gamma, data->adam_m_gamma->data, bytes,
-                                 cudaMemcpyHostToDevice));
-        }
-        if (data->d_v_gamma != NULL && data->adam_v_gamma != NULL) {
-            CUDA_CALL(cudaMemcpy(data->d_v_gamma, data->adam_v_gamma->data, bytes,
-                                 cudaMemcpyHostToDevice));
-        }
-        if (data->d_m_beta != NULL && data->adam_m_beta != NULL) {
-            CUDA_CALL(cudaMemcpy(data->d_m_beta, data->adam_m_beta->data, bytes,
-                                 cudaMemcpyHostToDevice));
-        }
-        if (data->d_v_beta != NULL && data->adam_v_beta != NULL) {
-            CUDA_CALL(cudaMemcpy(data->d_v_beta, data->adam_v_beta->data, bytes,
-                                 cudaMemcpyHostToDevice));
-        }
-        batchnorm_gpu_zero_gradients(data->d_grad_gamma, data->d_grad_beta, data->channels);
-    }
-#endif
 }
 
 static void skip_connection_release(SkipConnectionData *data)

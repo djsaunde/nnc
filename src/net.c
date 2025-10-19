@@ -522,6 +522,9 @@ void nn_set_optimizer(Network *nn, OptimizerKind kind, nn_float beta1, nn_float 
         } else if (layer->type == LAYER_BATCHNORM) {
             BatchNormLayerData *data = (BatchNormLayerData *) layer->data;
             data->adam_initialized = 0;
+#ifdef USE_CUDA
+            data->adam_device_initialized = 0;
+#endif
         }
     }
 }

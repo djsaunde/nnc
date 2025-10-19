@@ -27,6 +27,7 @@ typedef struct GpuWorkspace {
     nn_float *d_grad;
     nn_float *d_temp;
     nn_float *h_temp;
+    nn_float *d_grad_norm;
     size_t input_capacity;
     size_t target_capacity;
     size_t grad_capacity;
@@ -45,6 +46,7 @@ typedef struct GpuWorkspace {
 static void gpu_workspace_ensure(GpuWorkspace *workspace, size_t input_elems,
                                  size_t target_elems, size_t grad_elems);
 static void gpu_workspace_ensure_temp(GpuWorkspace *workspace, size_t elements);
+static void gpu_workspace_ensure_norm_buffer(GpuWorkspace *workspace);
 static void dropout_ensure_device_mask(DropoutLayerData *data, int elements);
 static void skip_connection_ensure_saved_device(SkipConnectionData *data,
                                                 size_t elements);
@@ -61,6 +63,7 @@ GpuWorkspace *gpu_workspace_create(void)
     workspace->theoretical_tflops = 209.5;
     workspace->total_vram_bytes = 0;
     workspace->total_vram_known = 0;
+    workspace->d_grad_norm = NULL;
     const char *env = getenv("NNC_GPU_TFLOPS");
     if (env != NULL) {
         char *endptr = NULL;
@@ -96,6 +99,9 @@ void gpu_workspace_destroy(GpuWorkspace *workspace)
     }
     if (workspace->d_temp != NULL) {
         CUDA_CALL(cudaFree(workspace->d_temp));
+    }
+    if (workspace->d_grad_norm != NULL) {
+        CUDA_CALL(cudaFree(workspace->d_grad_norm));
     }
     if (workspace->h_temp != NULL) {
         free(workspace->h_temp);
@@ -193,6 +199,16 @@ static void gpu_workspace_ensure_temp(GpuWorkspace *workspace, size_t elements)
         free(workspace->h_temp);
         workspace->h_temp = new_host;
         workspace->h_temp_capacity = elements;
+    }
+}
+
+static void gpu_workspace_ensure_norm_buffer(GpuWorkspace *workspace)
+{
+    if (workspace == NULL) {
+        return;
+    }
+    if (workspace->d_grad_norm == NULL) {
+        CUDA_CALL(cudaMalloc((void **) &workspace->d_grad_norm, sizeof(nn_float)));
     }
 }
 
@@ -308,8 +324,6 @@ ForwardCache *nn_forward_cached_gpu(Network *nn, Matrix *input)
         case LAYER_BATCHNORM: {
             BatchNormLayerData *data = (BatchNormLayerData *) layer->data;
             batchnorm_layer_gpu_ensure_capacity(data, batch_size);
-            batchnorm_layer_gpu_copy_params_to_device(data);
-            batchnorm_layer_gpu_copy_running_to_device(data);
             batchnorm_gpu_forward(d_current, d_current, data->d_gamma, data->d_beta,
                                   data->d_running_mean, data->d_running_var,
                                   data->d_batch_mean, data->d_batch_var,
@@ -439,8 +453,6 @@ TrainStepStats nn_train_batch_gpu(Network *nn, Matrix *input, Matrix *target,
         case LAYER_BATCHNORM: {
             BatchNormLayerData *data = (BatchNormLayerData *) layer->data;
             batchnorm_layer_gpu_ensure_capacity(data, batch_size);
-            batchnorm_layer_gpu_copy_params_to_device(data);
-            batchnorm_layer_gpu_copy_running_to_device(data);
             batchnorm_gpu_forward(d_current, d_current, data->d_gamma, data->d_beta,
                                   data->d_running_mean, data->d_running_var,
                                   data->d_batch_mean, data->d_batch_var,
@@ -483,8 +495,11 @@ TrainStepStats nn_train_batch_gpu(Network *nn, Matrix *input, Matrix *target,
     vector_subtract_inplace(workspace->d_grad, workspace->d_target,
                             current_rows * batch_size);
 
-    stats.grad_norm = gpu_vector_l2_norm(workspace->d_grad, current_rows * batch_size) /
-                      (nn_float) batch_size;
+    gpu_workspace_ensure_norm_buffer(workspace);
+    stats.grad_norm =
+        gpu_vector_l2_norm(workspace->d_grad, current_rows * batch_size,
+                           workspace->d_grad_norm) /
+        (nn_float) batch_size;
 
     nn_float *d_grad = workspace->d_grad;
     int grad_rows = current_rows;
@@ -523,7 +538,6 @@ TrainStepStats nn_train_batch_gpu(Network *nn, Matrix *input, Matrix *target,
                                    data->d_batch_var, data->d_normalized, data->d_grad_gamma,
                                    data->d_grad_beta, data->channels, data->spatial, batch_size,
                                    data->epsilon);
-            batchnorm_layer_gpu_copy_grads_to_host(data);
             d_grad = next_grad;
             grad_rows = data->channels * data->spatial;
             break;

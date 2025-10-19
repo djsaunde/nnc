@@ -119,6 +119,7 @@ typedef struct BatchNormLayerData {
     nn_float *d_v_gamma;
     nn_float *d_m_beta;
     nn_float *d_v_beta;
+    int adam_device_initialized;
 #endif
     int gpu_capacity;
 } BatchNormLayerData;
@@ -198,6 +199,7 @@ void conv2d_layer_apply_adamw(Conv2DLayerData *data, const OptimizerState *opt,
 #ifdef USE_CUDA
 void batchnorm_layer_gpu_ensure_capacity(BatchNormLayerData *data, int batch);
 void batchnorm_layer_gpu_copy_params_to_device(BatchNormLayerData *data);
+void batchnorm_layer_gpu_copy_params_to_host(BatchNormLayerData *data);
 void batchnorm_layer_gpu_copy_running_to_device(BatchNormLayerData *data);
 void batchnorm_layer_gpu_copy_running_to_host(BatchNormLayerData *data);
 void batchnorm_layer_gpu_copy_grads_to_host(BatchNormLayerData *data);

@@ -63,6 +63,18 @@ void batchnorm_gpu_backward(const nn_float *d_grad_out, nn_float *d_grad_in,
                             int channels, int spatial, int batch, nn_float epsilon);
 void batchnorm_gpu_zero_gradients(nn_float *d_grad_gamma, nn_float *d_grad_beta,
                                   int channels);
+void batchnorm_gpu_apply_sgd(nn_float *d_gamma, nn_float *d_beta,
+                             nn_float *d_grad_gamma, nn_float *d_grad_beta, int channels,
+                             nn_float learning_rate, nn_float weight_decay,
+                             nn_float grad_scale);
+void batchnorm_gpu_apply_adamw(nn_float *d_gamma, nn_float *d_beta,
+                               nn_float *d_grad_gamma, nn_float *d_grad_beta,
+                               nn_float *d_m_gamma, nn_float *d_v_gamma,
+                               nn_float *d_m_beta, nn_float *d_v_beta, int channels,
+                               nn_float learning_rate, nn_float beta1, nn_float beta2,
+                               nn_float epsilon, nn_float weight_decay,
+                               nn_float inv_bias_correction1,
+                               nn_float inv_bias_correction2, nn_float grad_scale);
 void activation_gpu_forward(int kind, nn_float *d_data, int rows, int cols);
 void activation_gpu_backward(int kind, const nn_float *d_output, nn_float *d_grad,
                              int rows, int cols);
@@ -78,7 +90,7 @@ void softmax_gpu_backward(const nn_float *d_output, const nn_float *d_grad_outpu
 void vector_subtract_inplace(nn_float *d_output, const nn_float *d_target,
                              int elements);
 void vector_add_inplace(nn_float *d_output, const nn_float *d_other, int elements);
-nn_float gpu_vector_l2_norm(const nn_float *d_vector, int elements);
+nn_float gpu_vector_l2_norm(const nn_float *d_vector, int elements, nn_float *d_workspace);
 
 #ifdef __cplusplus
 }

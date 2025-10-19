@@ -86,6 +86,10 @@ typedef struct Conv2DLayerGpuContext {
     nn_float *d_m_bias;
     nn_float *d_v_bias;
     int adam_initialized;
+    nn_float *d_col_buffer;
+    size_t col_capacity;
+    nn_float *d_output_cols;
+    size_t output_col_capacity;
 } Conv2DLayerGpuContext;
 
 static void ensure_capacity(DenseLayerGpuContext *ctx, int batch)
@@ -141,29 +145,67 @@ static void dense_gpu_ensure_adam_state(DenseLayerGpuContext *ctx)
 
 static void conv2d_ensure_capacity(Conv2DLayerGpuContext *ctx, int batch)
 {
-    if (batch <= ctx->capacity) {
+    if (batch <= 0) {
         return;
     }
 
-    size_t input_bytes = (size_t) ctx->input_size * (size_t) batch * sizeof(nn_float);
-    size_t output_bytes = (size_t) ctx->output_size * (size_t) batch * sizeof(nn_float);
+    if (batch > ctx->capacity) {
+        size_t input_bytes = (size_t) ctx->input_size * (size_t) batch * sizeof(nn_float);
+        size_t output_bytes = (size_t) ctx->output_size * (size_t) batch * sizeof(nn_float);
 
-    if (ctx->d_last_input != NULL) {
-        check_cuda(cudaFree(ctx->d_last_input), "cudaFree conv last_input");
-    }
-    if (ctx->d_output != NULL) {
-        check_cuda(cudaFree(ctx->d_output), "cudaFree conv output");
-    }
-    if (ctx->d_grad_input != NULL) {
-        check_cuda(cudaFree(ctx->d_grad_input), "cudaFree conv grad_input");
+        if (ctx->d_last_input != NULL) {
+            check_cuda(cudaFree(ctx->d_last_input), "cudaFree conv last_input");
+        }
+        if (ctx->d_output != NULL) {
+            check_cuda(cudaFree(ctx->d_output), "cudaFree conv output");
+        }
+        if (ctx->d_grad_input != NULL) {
+            check_cuda(cudaFree(ctx->d_grad_input), "cudaFree conv grad_input");
+        }
+
+        check_cuda(cudaMalloc((void **) &ctx->d_last_input, input_bytes),
+                   "cudaMalloc conv last_input");
+        check_cuda(cudaMalloc((void **) &ctx->d_output, output_bytes),
+                   "cudaMalloc conv output");
+        check_cuda(cudaMalloc((void **) &ctx->d_grad_input, input_bytes),
+                   "cudaMalloc conv grad_input");
+
+        ctx->capacity = batch;
     }
 
-    check_cuda(cudaMalloc((void **) &ctx->d_last_input, input_bytes), "cudaMalloc conv last_input");
-    check_cuda(cudaMalloc((void **) &ctx->d_output, output_bytes), "cudaMalloc conv output");
-    check_cuda(cudaMalloc((void **) &ctx->d_grad_input, input_bytes),
-               "cudaMalloc conv grad_input");
+    int output_spatial = ctx->output_height * ctx->output_width;
+    int columns = output_spatial * batch;
+    int kernel_dim = ctx->in_channels * ctx->kernel_h * ctx->kernel_w;
 
-    ctx->capacity = batch;
+    size_t col_required = (size_t) kernel_dim * (size_t) columns;
+    if (col_required > ctx->col_capacity) {
+        if (ctx->d_col_buffer != NULL) {
+            check_cuda(cudaFree(ctx->d_col_buffer), "cudaFree conv col_buffer");
+        }
+        if (col_required > 0) {
+            check_cuda(cudaMalloc((void **) &ctx->d_col_buffer,
+                                 col_required * sizeof(nn_float)),
+                       "cudaMalloc conv col_buffer");
+        } else {
+            ctx->d_col_buffer = NULL;
+        }
+        ctx->col_capacity = col_required;
+    }
+
+    size_t output_col_required = (size_t) ctx->out_channels * (size_t) columns;
+    if (output_col_required > ctx->output_col_capacity) {
+        if (ctx->d_output_cols != NULL) {
+            check_cuda(cudaFree(ctx->d_output_cols), "cudaFree conv output_cols");
+        }
+        if (output_col_required > 0) {
+            check_cuda(cudaMalloc((void **) &ctx->d_output_cols,
+                                 output_col_required * sizeof(nn_float)),
+                       "cudaMalloc conv output_cols");
+        } else {
+            ctx->d_output_cols = NULL;
+        }
+        ctx->output_col_capacity = output_col_required;
+    }
 }
 
 static void conv2d_gpu_ensure_adam_state(Conv2DLayerGpuContext *ctx)
@@ -509,6 +551,10 @@ Conv2DLayerGpuContext *conv2d_gpu_create(int in_channels, int out_channels, int 
     ctx->d_m_bias = NULL;
     ctx->d_v_bias = NULL;
     ctx->adam_initialized = 0;
+    ctx->d_col_buffer = NULL;
+    ctx->col_capacity = 0;
+    ctx->d_output_cols = NULL;
+    ctx->output_col_capacity = 0;
 
     size_t weight_bytes = (size_t) ctx->weight_elements * sizeof(nn_float);
     size_t bias_bytes = (size_t) ctx->out_channels * sizeof(nn_float);
@@ -564,46 +610,173 @@ void conv2d_gpu_destroy(Conv2DLayerGpuContext *ctx)
     if (ctx->d_v_bias != NULL) {
         check_cuda(cudaFree(ctx->d_v_bias), "cudaFree conv v_bias");
     }
+    if (ctx->d_col_buffer != NULL) {
+        check_cuda(cudaFree(ctx->d_col_buffer), "cudaFree conv col_buffer");
+    }
+    if (ctx->d_output_cols != NULL) {
+        check_cuda(cudaFree(ctx->d_output_cols), "cudaFree conv output_cols");
+    }
     free(ctx);
 }
 
 void conv2d_gpu_set_weights(Conv2DLayerGpuContext *ctx, const nn_float *weights,
                             const nn_float *bias)
 {
-    size_t weight_bytes = (size_t) ctx->weight_elements * sizeof(nn_float);
+    int rows = ctx->out_channels;
+    int cols = ctx->in_channels * ctx->kernel_h * ctx->kernel_w;
+    size_t weight_bytes = (size_t) rows * (size_t) cols * sizeof(nn_float);
     size_t bias_bytes = (size_t) ctx->out_channels * sizeof(nn_float);
-    check_cuda(cudaMemcpy(ctx->d_weights, weights, weight_bytes, cudaMemcpyHostToDevice),
+
+    nn_float *temp = (nn_float *) malloc(weight_bytes);
+    if (temp == NULL) {
+        fprintf(stderr, "Failed to allocate temporary conv weight buffer\n");
+        exit(EXIT_FAILURE);
+    }
+    row_to_col(temp, weights, rows, cols);
+    check_cuda(cudaMemcpy(ctx->d_weights, temp, weight_bytes, cudaMemcpyHostToDevice),
                "cudaMemcpy conv weights");
+    free(temp);
+
     check_cuda(cudaMemcpy(ctx->d_bias, bias, bias_bytes, cudaMemcpyHostToDevice),
                "cudaMemcpy conv bias");
 }
 
-static __global__ void conv2d_forward_kernel(const nn_float *input, const nn_float *weights,
-                                             const nn_float *bias, nn_float *output, int batch,
-                                             int in_channels, int out_channels, int input_height,
-                                             int input_width, int kernel_h, int kernel_w,
-                                             int stride_h, int stride_w, int pad_h, int pad_w,
-                                             int output_height, int output_width, int input_size,
-                                             int output_size)
+static __global__ void conv2d_im2col_kernel(const nn_float *input, nn_float *columns, int batch,
+                                            int in_channels, int input_height, int input_width,
+                                            int kernel_h, int kernel_w, int stride_h, int stride_w,
+                                            int pad_h, int pad_w, int output_height,
+                                            int output_width, int input_size, int kernel_dim)
 {
+    int column_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int columns_total = batch * output_height * output_width;
+    if (column_idx >= columns_total) {
+        return;
+    }
+
+    int spatial = output_height * output_width;
+    int b = column_idx / spatial;
+    int within = column_idx % spatial;
+    int oh = within / output_width;
+    int ow = within % output_width;
+
+    const nn_float *input_ptr = input + (size_t) b * (size_t) input_size;
+    nn_float *col_ptr = columns + (size_t) column_idx * (size_t) kernel_dim;
+
+    for (int ic = 0; ic < in_channels; ic++) {
+        for (int kh = 0; kh < kernel_h; kh++) {
+            int ih = oh * stride_h - pad_h + kh;
+            for (int kw = 0; kw < kernel_w; kw++) {
+                int iw = ow * stride_w - pad_w + kw;
+                int row = ((ic * kernel_h + kh) * kernel_w + kw);
+                if (ih < 0 || ih >= input_height || iw < 0 || iw >= input_width) {
+                    col_ptr[row] = 0.0f;
+                } else {
+                    int input_index = ((ic * input_height + ih) * input_width + iw);
+                    col_ptr[row] = input_ptr[input_index];
+                }
+            }
+        }
+    }
+}
+
+static __global__ void conv2d_output_reformat_bias_kernel(const nn_float *gemm_output,
+                                                          const nn_float *bias, nn_float *output,
+                                                          int out_channels, int output_height,
+                                                          int output_width, int batch)
+{
+    int rows = out_channels * output_height * output_width;
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = batch * output_size;
+    int total = rows * batch;
     if (idx >= total) {
         return;
     }
 
-    int per_sample = output_size;
-    int b = idx / per_sample;
-    int rem = idx % per_sample;
-    int plane = output_height * output_width;
-    int oc = rem / plane;
-    int within = rem % plane;
+    int col = idx / rows;
+    int row = idx % rows;
+    int spatial = output_height * output_width;
+    int oc = row / spatial;
+    int within = row % spatial;
+    int column_index = col * spatial + within;
+
+    nn_float value = gemm_output[oc + column_index * out_channels] + bias[oc];
+    output[idx] = value;
+}
+
+static __global__ void conv2d_grad_output_to_matrix_kernel(const nn_float *grad_output,
+                                                           nn_float *grad_columns,
+                                                           int out_channels, int output_height,
+                                                           int output_width, int batch)
+{
+    int spatial = output_height * output_width;
+    int columns = spatial * batch;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = out_channels * columns;
+    if (idx >= total) {
+        return;
+    }
+
+    int col = idx / out_channels;
+    int oc = idx % out_channels;
+    int b = col / spatial;
+    int within = col % spatial;
+    int row = oc * spatial + within;
+    int rows = out_channels * spatial;
+
+    grad_columns[idx] = grad_output[row + b * rows];
+}
+
+static __global__ void conv2d_bias_grad_kernel(const nn_float *grad_columns,
+                                               nn_float *grad_bias, int out_channels,
+                                               int columns)
+{
+    int oc = blockIdx.x;
+    if (oc >= out_channels) {
+        return;
+    }
+
+    nn_float sum = 0.0f;
+    for (int idx = threadIdx.x; idx < columns; idx += blockDim.x) {
+        sum += grad_columns[oc + idx * out_channels];
+    }
+
+    extern __shared__ nn_float shared[];
+    shared[threadIdx.x] = sum;
+    __syncthreads();
+
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            shared[threadIdx.x] += shared[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0) {
+        grad_bias[oc] = shared[0];
+    }
+}
+
+static __global__ void conv2d_col2im_kernel(const nn_float *columns, nn_float *grad_input,
+                                            int batch, int in_channels, int input_height,
+                                            int input_width, int kernel_h, int kernel_w,
+                                            int stride_h, int stride_w, int pad_h, int pad_w,
+                                            int output_height, int output_width, int input_size,
+                                            int kernel_dim)
+{
+    int column_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int columns_total = batch * output_height * output_width;
+    if (column_idx >= columns_total) {
+        return;
+    }
+
+    int spatial = output_height * output_width;
+    int b = column_idx / spatial;
+    int within = column_idx % spatial;
     int oh = within / output_width;
     int ow = within % output_width;
 
-    nn_float sum = bias[oc];
-    int kernel_area = kernel_h * kernel_w;
-    int weight_cols = in_channels * kernel_area;
+    const nn_float *col_ptr = columns + (size_t) column_idx * (size_t) kernel_dim;
+    nn_float *grad_ptr = grad_input + (size_t) b * (size_t) input_size;
+
     for (int ic = 0; ic < in_channels; ic++) {
         for (int kh = 0; kh < kernel_h; kh++) {
             int ih = oh * stride_h - pad_h + kh;
@@ -615,17 +788,12 @@ static __global__ void conv2d_forward_kernel(const nn_float *input, const nn_flo
                 if (iw < 0 || iw >= input_width) {
                     continue;
                 }
-                int input_row = ((ic * input_height + ih) * input_width + iw);
-                nn_float input_val = input[input_row + b * input_size];
-                int w_idx = oc * weight_cols + ic * kernel_area + kh * kernel_w + kw;
-                nn_float weight_val = weights[w_idx];
-                sum += weight_val * input_val;
+                int row = ((ic * kernel_h + kh) * kernel_w + kw);
+                int input_index = ((ic * input_height + ih) * input_width + iw);
+                atomicAdd(&grad_ptr[input_index], col_ptr[row]);
             }
         }
     }
-
-    int output_row = ((oc * output_height + oh) * output_width + ow);
-    output[output_row + b * output_size] = sum;
 }
 
 nn_float *conv2d_gpu_forward_device(Conv2DLayerGpuContext *ctx, const nn_float *d_input,
@@ -640,73 +808,42 @@ nn_float *conv2d_gpu_forward_device(Conv2DLayerGpuContext *ctx, const nn_float *
     check_cuda(cudaMemcpy(ctx->d_last_input, d_input, input_bytes, cudaMemcpyDeviceToDevice),
                "cudaMemcpy conv last_input");
 
-    int total = batch * ctx->output_size;
+    int kernel_dim = ctx->in_channels * ctx->kernel_h * ctx->kernel_w;
+    int output_spatial = ctx->output_height * ctx->output_width;
+    int columns = output_spatial * batch;
+
     int block = 256;
-    int grid = (total + block - 1) / block;
+    int grid = (columns + block - 1) / block;
     if (grid > 0) {
-        conv2d_forward_kernel<<<grid, block>>>(ctx->d_last_input, ctx->d_weights, ctx->d_bias,
-                                               ctx->d_output, batch, ctx->in_channels,
-                                               ctx->out_channels, ctx->input_height,
-                                               ctx->input_width, ctx->kernel_h, ctx->kernel_w,
-                                               ctx->stride_h, ctx->stride_w, ctx->pad_h, ctx->pad_w,
-                                               ctx->output_height, ctx->output_width,
-                                               ctx->input_size, ctx->output_size);
-        check_cuda(cudaGetLastError(), "conv2d_forward_kernel");
+        conv2d_im2col_kernel<<<grid, block>>>(ctx->d_last_input, ctx->d_col_buffer, batch,
+                                              ctx->in_channels, ctx->input_height,
+                                              ctx->input_width, ctx->kernel_h, ctx->kernel_w,
+                                              ctx->stride_h, ctx->stride_w, ctx->pad_h,
+                                              ctx->pad_w, ctx->output_height, ctx->output_width,
+                                              ctx->input_size, kernel_dim);
+        check_cuda(cudaGetLastError(), "conv2d_im2col_kernel");
+    }
+
+    const nn_float alpha = 1.0f;
+    const nn_float beta_zero = 0.0f;
+    cublasHandle_t handle = global_handle();
+    check_cublas(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, ctx->out_channels, columns,
+                              kernel_dim, &alpha, ctx->d_weights, ctx->out_channels,
+                              ctx->d_col_buffer, kernel_dim, &beta_zero, ctx->d_output_cols,
+                              ctx->out_channels),
+                 "conv2d forward gemm");
+
+    int total = ctx->output_size * batch;
+    int block_out = 256;
+    int grid_out = (total + block_out - 1) / block_out;
+    if (grid_out > 0) {
+        conv2d_output_reformat_bias_kernel<<<grid_out, block_out>>>(
+            ctx->d_output_cols, ctx->d_bias, ctx->d_output, ctx->out_channels,
+            ctx->output_height, ctx->output_width, batch);
+        check_cuda(cudaGetLastError(), "conv2d_output_reformat_bias_kernel");
     }
 
     return ctx->d_output;
-}
-
-static __global__ void conv2d_backward_kernel(const nn_float *grad_output,
-                                              const nn_float *last_input,
-                                              const nn_float *weights, nn_float *grad_input,
-                                              nn_float *grad_weights, nn_float *grad_bias,
-                                              int batch, int in_channels, int out_channels,
-                                              int input_height, int input_width, int kernel_h,
-                                              int kernel_w, int stride_h, int stride_w, int pad_h,
-                                              int pad_w, int output_height, int output_width,
-                                              int input_size, int output_size)
-{
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = batch * output_size;
-    if (idx >= total) {
-        return;
-    }
-
-    int plane = output_height * output_width;
-    int kernel_area = kernel_h * kernel_w;
-    int weight_cols = in_channels * kernel_area;
-
-    int b = idx / output_size;
-    int rem = idx % output_size;
-    int oc = rem / plane;
-    int within = rem % plane;
-    int oh = within / output_width;
-    int ow = within % output_width;
-
-    int output_row = ((oc * output_height + oh) * output_width + ow);
-    nn_float grad = grad_output[output_row + b * output_size];
-    atomicAdd(&grad_bias[oc], grad);
-
-    for (int ic = 0; ic < in_channels; ic++) {
-        for (int kh = 0; kh < kernel_h; kh++) {
-            int ih = oh * stride_h - pad_h + kh;
-            if (ih < 0 || ih >= input_height) {
-                continue;
-            }
-            for (int kw = 0; kw < kernel_w; kw++) {
-                int iw = ow * stride_w - pad_w + kw;
-                if (iw < 0 || iw >= input_width) {
-                    continue;
-                }
-                int input_row = ((ic * input_height + ih) * input_width + iw);
-                nn_float input_val = last_input[input_row + b * input_size];
-                int w_idx = oc * weight_cols + ic * kernel_area + kh * kernel_w + kw;
-                atomicAdd(&grad_weights[w_idx], grad * input_val);
-                atomicAdd(&grad_input[input_row + b * input_size], grad * weights[w_idx]);
-            }
-        }
-    }
 }
 
 nn_float *conv2d_gpu_backward_device(Conv2DLayerGpuContext *ctx, const nn_float *d_grad_output,
@@ -726,19 +863,64 @@ nn_float *conv2d_gpu_backward_device(Conv2DLayerGpuContext *ctx, const nn_float 
                "cudaMemset conv grad_weights");
     check_cuda(cudaMemset(ctx->d_grad_bias, 0, grad_bias_bytes), "cudaMemset conv grad_bias");
 
-    int total = batch * ctx->output_size;
+    int kernel_dim = ctx->in_channels * ctx->kernel_h * ctx->kernel_w;
+    int output_spatial = ctx->output_height * ctx->output_width;
+    int columns = output_spatial * batch;
+
     int block = 256;
-    int grid = (total + block - 1) / block;
+    int grid = (columns + block - 1) / block;
     if (grid > 0) {
-        conv2d_backward_kernel<<<grid, block>>>(d_grad_output, ctx->d_last_input, ctx->d_weights,
-                                                ctx->d_grad_input, ctx->d_grad_weights,
-                                                ctx->d_grad_bias, batch, ctx->in_channels,
-                                                ctx->out_channels, ctx->input_height,
-                                                ctx->input_width, ctx->kernel_h, ctx->kernel_w,
-                                                ctx->stride_h, ctx->stride_w, ctx->pad_h,
-                                                ctx->pad_w, ctx->output_height, ctx->output_width,
-                                                ctx->input_size, ctx->output_size);
-        check_cuda(cudaGetLastError(), "conv2d_backward_kernel");
+        conv2d_im2col_kernel<<<grid, block>>>(ctx->d_last_input, ctx->d_col_buffer, batch,
+                                              ctx->in_channels, ctx->input_height,
+                                              ctx->input_width, ctx->kernel_h, ctx->kernel_w,
+                                              ctx->stride_h, ctx->stride_w, ctx->pad_h,
+                                              ctx->pad_w, ctx->output_height, ctx->output_width,
+                                              ctx->input_size, kernel_dim);
+        check_cuda(cudaGetLastError(), "conv2d_im2col_kernel");
+    }
+
+    int total_cols = ctx->out_channels * columns;
+    int block_cols = 256;
+    int grid_cols = (total_cols + block_cols - 1) / block_cols;
+    if (grid_cols > 0) {
+        conv2d_grad_output_to_matrix_kernel<<<grid_cols, block_cols>>>(
+            d_grad_output, ctx->d_output_cols, ctx->out_channels, ctx->output_height,
+            ctx->output_width, batch);
+        check_cuda(cudaGetLastError(), "conv2d_grad_output_to_matrix_kernel");
+    }
+
+    int bias_block = columns >= 256 ? 256 : columns;
+    if (bias_block == 0) {
+        bias_block = 1;
+    }
+    size_t shared = (size_t) bias_block * sizeof(nn_float);
+    conv2d_bias_grad_kernel<<<ctx->out_channels, bias_block, shared>>>(
+        ctx->d_output_cols, ctx->d_grad_bias, ctx->out_channels, columns);
+    check_cuda(cudaGetLastError(), "conv2d_bias_grad_kernel");
+
+    const nn_float alpha = 1.0f;
+    const nn_float beta_zero = 0.0f;
+    cublasHandle_t handle = global_handle();
+    check_cublas(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_T, ctx->out_channels, kernel_dim,
+                              columns, &alpha, ctx->d_output_cols, ctx->out_channels,
+                              ctx->d_col_buffer, kernel_dim, &beta_zero, ctx->d_grad_weights,
+                              ctx->out_channels),
+                 "conv2d grad weights gemm");
+
+    check_cublas(cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N, kernel_dim, columns,
+                              ctx->out_channels, &alpha, ctx->d_weights, ctx->out_channels,
+                              ctx->d_output_cols, ctx->out_channels, &beta_zero,
+                              ctx->d_col_buffer, kernel_dim),
+                 "conv2d grad input columns gemm");
+
+    if (grid > 0) {
+        conv2d_col2im_kernel<<<grid, block>>>(ctx->d_col_buffer, ctx->d_grad_input, batch,
+                                             ctx->in_channels, ctx->input_height, ctx->input_width,
+                                             ctx->kernel_h, ctx->kernel_w, ctx->stride_h,
+                                             ctx->stride_w, ctx->pad_h, ctx->pad_w,
+                                             ctx->output_height, ctx->output_width,
+                                             ctx->input_size, kernel_dim);
+        check_cuda(cudaGetLastError(), "conv2d_col2im_kernel");
     }
 
     return ctx->d_grad_input;
@@ -1319,6 +1501,69 @@ void batchnorm_gpu_zero_gradients(nn_float *d_grad_gamma, nn_float *d_grad_beta,
     }
 }
 
+static __global__ void batchnorm_sgd_update_kernel(nn_float *gamma, nn_float *beta,
+                                                   nn_float *grad_gamma, nn_float *grad_beta,
+                                                   int channels, nn_float learning_rate,
+                                                   nn_float weight_decay, nn_float grad_scale)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= channels) {
+        return;
+    }
+    nn_float g_gamma = grad_gamma[idx] * grad_scale;
+    nn_float g_beta = grad_beta[idx] * grad_scale;
+    if (weight_decay != 0.0f) {
+        g_gamma += weight_decay * gamma[idx];
+    }
+    gamma[idx] -= learning_rate * g_gamma;
+    beta[idx] -= learning_rate * g_beta;
+    grad_gamma[idx] = 0.0f;
+    grad_beta[idx] = 0.0f;
+}
+
+void batchnorm_gpu_apply_sgd(nn_float *d_gamma, nn_float *d_beta, nn_float *d_grad_gamma,
+                             nn_float *d_grad_beta, int channels, nn_float learning_rate,
+                             nn_float weight_decay, nn_float grad_scale)
+{
+    if (channels <= 0) {
+        return;
+    }
+    int block = 256;
+    int grid = (channels + block - 1) / block;
+    batchnorm_sgd_update_kernel<<<grid, block>>>(d_gamma, d_beta, d_grad_gamma, d_grad_beta,
+                                                channels, learning_rate, weight_decay,
+                                                grad_scale);
+    check_cuda(cudaGetLastError(), "batchnorm_sgd_update_kernel");
+}
+
+void batchnorm_gpu_apply_adamw(nn_float *d_gamma, nn_float *d_beta, nn_float *d_grad_gamma,
+                               nn_float *d_grad_beta, nn_float *d_m_gamma,
+                               nn_float *d_v_gamma, nn_float *d_m_beta, nn_float *d_v_beta,
+                               int channels, nn_float learning_rate, nn_float beta1,
+                               nn_float beta2, nn_float epsilon, nn_float weight_decay,
+                               nn_float inv_bias_correction1,
+                               nn_float inv_bias_correction2, nn_float grad_scale)
+{
+    if (channels <= 0) {
+        return;
+    }
+    nn_float one_minus_beta1 = 1.0f - beta1;
+    nn_float one_minus_beta2 = 1.0f - beta2;
+    int block = 256;
+    int grid = (channels + block - 1) / block;
+    adamw_update_kernel<<<grid, block>>>(d_gamma, d_grad_gamma, d_m_gamma, d_v_gamma, channels,
+                                         beta1, beta2, one_minus_beta1, one_minus_beta2,
+                                         epsilon, learning_rate, weight_decay,
+                                         inv_bias_correction1, inv_bias_correction2,
+                                         grad_scale);
+    check_cuda(cudaGetLastError(), "batchnorm adamw gamma");
+    adamw_update_kernel<<<grid, block>>>(d_beta, d_grad_beta, d_m_beta, d_v_beta, channels,
+                                         beta1, beta2, one_minus_beta1, one_minus_beta2,
+                                         epsilon, learning_rate, 0.0f, inv_bias_correction1,
+                                         inv_bias_correction2, grad_scale);
+    check_cuda(cudaGetLastError(), "batchnorm adamw beta");
+}
+
 static __global__ void vector_add_inplace_kernel(nn_float *output, const nn_float *other, int n)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1383,13 +1628,17 @@ static __global__ void l2_norm_kernel(const nn_float *data, int n, nn_float *res
     }
 }
 
-nn_float gpu_vector_l2_norm(const nn_float *d_vector, int elements)
+nn_float gpu_vector_l2_norm(const nn_float *d_vector, int elements, nn_float *d_workspace)
 {
     if (elements <= 0) {
         return 0.0f;
     }
-    nn_float *d_sum = NULL;
-    check_cuda(cudaMalloc((void **) &d_sum, sizeof(nn_float)), "cudaMalloc l2 sum");
+    nn_float *d_sum = d_workspace;
+    int allocated_locally = 0;
+    if (d_sum == NULL) {
+        check_cuda(cudaMalloc((void **) &d_sum, sizeof(nn_float)), "cudaMalloc l2 sum");
+        allocated_locally = 1;
+    }
     check_cuda(cudaMemset(d_sum, 0, sizeof(nn_float)), "cudaMemset l2 sum");
 
     int block = 256;
@@ -1403,7 +1652,9 @@ nn_float gpu_vector_l2_norm(const nn_float *d_vector, int elements)
     nn_float host_sum = 0.0f;
     check_cuda(cudaMemcpy(&host_sum, d_sum, sizeof(nn_float), cudaMemcpyDeviceToHost),
                "cudaMemcpy l2 sum");
-    check_cuda(cudaFree(d_sum), "cudaFree l2 sum");
+    if (allocated_locally) {
+        check_cuda(cudaFree(d_sum), "cudaFree l2 sum");
+    }
 
     return sqrtf(host_sum);
 }

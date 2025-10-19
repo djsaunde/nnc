@@ -16,6 +16,7 @@
 #endif
 
 #include "matrix.h"
+#include "augment.h"
 #include "net.h"
 
 #define STB_IMAGE_IMPLEMENTATION
@@ -51,6 +52,8 @@ typedef struct {
     unsigned int seed;
     int log_steps;
     int log_memory;
+    int enable_train_augment;
+    int enable_eval_augment;
 } ExampleConfig;
 
 typedef struct {
@@ -125,7 +128,8 @@ typedef struct {
 static void imagenet_record_close(ImagenetRecord *record);
 static int imagenet_record_open(ImagenetRecord *record, const char *path, int limit);
 static int imagenet_record_read_column(ImagenetRecord *record, int index, Matrix *input,
-                                       Matrix *target, int column);
+                                       Matrix *target, int column,
+                                       const AugmentationConfig *augment);
 
 static const char *datasource_kind_name(DataSourceKind kind)
 {
@@ -563,7 +567,8 @@ static int tiny_dataset_load_test(const char *test_dir, int limit, TinyImageData
 }
 
 static int tiny_dataset_fill_column(const TinyImageDataset *dataset, int index, Matrix *input,
-                                    Matrix *target, int column)
+                                    Matrix *target, int column,
+                                    const AugmentationConfig *augment)
 {
     if (dataset == NULL || input == NULL || target == NULL) {
         return 0;
@@ -591,30 +596,27 @@ static int tiny_dataset_fill_column(const TinyImageDataset *dataset, int index, 
         return 0;
     }
 
-    int input_stride = input->cols;
-    int target_stride = target->cols;
+    int target_stride = target != NULL ? target->cols : 0;
 
-    for (int c = 0; c < IMAGENET_CHANNELS; c++) {
-        for (int y = 0; y < IMAGENET_HEIGHT; y++) {
-            for (int x = 0; x < IMAGENET_WIDTH; x++) {
-                int src_index = (y * IMAGENET_WIDTH + x) * IMAGENET_CHANNELS + c;
-                nn_float value = (nn_float) pixels[src_index] / 255.0f;
-                int dest_row = (c * IMAGENET_HEIGHT + y) * IMAGENET_WIDTH + x;
-                input->data[dest_row * input_stride + column] = value;
-            }
-        }
+    if (!augmentation_apply_uint8_to_matrix(pixels, AUGMENT_LAYOUT_NHWC, IMAGENET_WIDTH,
+                                            IMAGENET_HEIGHT, IMAGENET_CHANNELS, augment, input,
+                                            column)) {
+        stbi_image_free(pixels);
+        return 0;
     }
 
     stbi_image_free(pixels);
 
-    for (int row = 0; row < target->rows; row++) {
-        target->data[row * target_stride + column] = 0.0f;
-    }
+    if (target != NULL && target->rows > 0) {
+        for (int row = 0; row < target->rows; row++) {
+            target->data[row * target_stride + column] = 0.0f;
+        }
 
-    if (dataset->has_labels) {
-        int label = dataset->labels[index];
-        if (label >= 0 && label < target->rows) {
-            target->data[label * target_stride + column] = 1.0f;
+        if (dataset->has_labels) {
+            int label = dataset->labels[index];
+            if (label >= 0 && label < target->rows) {
+                target->data[label * target_stride + column] = 1.0f;
+            }
         }
     }
 
@@ -695,16 +697,18 @@ static int datasource_sample_count(const DataSource *source)
 }
 
 static int datasource_fill_column(DataSource *source, int index, Matrix *input, Matrix *target,
-                                  int column)
+                                  int column, const AugmentationConfig *augment)
 {
     if (source == NULL) {
         return 0;
     }
     if (source->kind == DATA_SOURCE_RECORD) {
-        return imagenet_record_read_column(&source->impl.record, index, input, target, column);
+        return imagenet_record_read_column(&source->impl.record, index, input, target, column,
+                                           augment);
     }
     if (source->kind == DATA_SOURCE_TINY_DIR) {
-        return tiny_dataset_fill_column(&source->impl.tiny, index, input, target, column);
+        return tiny_dataset_fill_column(&source->impl.tiny, index, input, target, column,
+                                        augment);
     }
     return 0;
 }
@@ -815,7 +819,9 @@ static void print_usage(const char *prog)
         "cpu)\n"
         "  --seed N              RNG seed (default: 42)\n"
         "  --log-steps N         Batch logging interval (default: 100, 0 disables)\n"
-        "  --log-memory          Log GPU memory usage each step (default: off)\n\n"
+        "  --log-memory          Log GPU memory usage each step (default: off)\n"
+        "  --no-train-aug        Disable training-time image augmentations\n"
+        "  --no-eval-aug         Disable eval-time center crop/normalization\n\n"
         "Record format: little-endian header (magic 0x%08X, version %u, sample "
         "count),\n"
         "followed by samples stored as uint16 label then %d bytes of interleaved RGB "
@@ -861,6 +867,10 @@ static int parse_arguments(int argc, char **argv, ExampleConfig *config)
             config->log_steps = atoi(argv[++i]);
         } else if (strcmp(arg, "--log-memory") == 0) {
             config->log_memory = 1;
+        } else if (strcmp(arg, "--no-train-aug") == 0) {
+            config->enable_train_augment = 0;
+        } else if (strcmp(arg, "--no-eval-aug") == 0) {
+            config->enable_eval_augment = 0;
         } else {
             fprintf(stderr, "Unknown argument: %s\n", arg);
             return 0;
@@ -880,7 +890,8 @@ static void shuffle_indices(int *indices, int count)
 }
 
 static int imagenet_record_read_column(ImagenetRecord *record, int index, Matrix *input,
-                                       Matrix *target, int column)
+                                       Matrix *target, int column,
+                                       const AugmentationConfig *augment)
 {
     if (record == NULL || record->file == NULL) {
         return 0;
@@ -908,15 +919,20 @@ static int imagenet_record_read_column(ImagenetRecord *record, int index, Matrix
         return 0;
     }
 
-    for (int row = 0; row < input->rows; row++) {
-        input->data[row * input->cols + column] =
-            (nn_float) record->buffer[row] / 255.0f;
+    if (!augmentation_apply_uint8_to_matrix(record->buffer, AUGMENT_LAYOUT_NCHW,
+                                            IMAGENET_WIDTH, IMAGENET_HEIGHT,
+                                            IMAGENET_CHANNELS, augment, input, column)) {
+        return 0;
     }
 
-    for (int row = 0; row < target->rows; row++) {
-        target->data[row * target->cols + column] = 0.0f;
+    if (target != NULL && target->rows > 0) {
+        for (int row = 0; row < target->rows; row++) {
+            target->data[row * target->cols + column] = 0.0f;
+        }
+        if (label_u16 < target->rows) {
+            target->data[label_u16 * target->cols + column] = 1.0f;
+        }
     }
-    target->data[label_u16 * target->cols + column] = 1.0f;
     return 1;
 }
 
@@ -1132,7 +1148,8 @@ static Network *build_resnet50_like(BackendKind backend)
 
 static void evaluate_source(Network *nn, DataSource *source, const char *label, int batch_size,
                             Matrix *input, Matrix *target, Matrix *prediction,
-                            double *loss_out, double *acc_out)
+                            const AugmentationConfig *augment, double *loss_out,
+                            double *acc_out)
 {
     int total = datasource_sample_count(source);
     if (total <= 0) {
@@ -1171,7 +1188,7 @@ static void evaluate_source(Network *nn, DataSource *source, const char *label, 
 
         int ok = 1;
         for (int col = 0; col < current; col++) {
-            if (!datasource_fill_column(source, start + col, input, target, col)) {
+            if (!datasource_fill_column(source, start + col, input, target, col, augment)) {
                 fprintf(stderr, "Failed to load sample %d from source.\n", start + col);
                 ok = 0;
                 break;
@@ -1241,6 +1258,8 @@ int main(int argc, char **argv)
         .seed = 42U,
         .log_steps = 100,
         .log_memory = 0,
+        .enable_train_augment = 1,
+        .enable_eval_augment = 1,
     };
 
     if (!parse_arguments(argc, argv, &config)) {
@@ -1262,6 +1281,23 @@ int main(int argc, char **argv)
     }
 
     srand(config.seed);
+
+    AugmentationConfig train_aug;
+    AugmentationConfig eval_aug;
+    if (config.enable_train_augment) {
+        augmentation_config_imagenet_train(&train_aug, IMAGENET_WIDTH, IMAGENET_HEIGHT,
+                                           IMAGENET_CHANNELS);
+    } else {
+        augmentation_config_identity(&train_aug, IMAGENET_WIDTH, IMAGENET_HEIGHT,
+                                     IMAGENET_CHANNELS, 1);
+    }
+    if (config.enable_eval_augment) {
+        augmentation_config_imagenet_eval(&eval_aug, IMAGENET_WIDTH, IMAGENET_HEIGHT,
+                                          IMAGENET_CHANNELS);
+    } else {
+        augmentation_config_identity(&eval_aug, IMAGENET_WIDTH, IMAGENET_HEIGHT,
+                                     IMAGENET_CHANNELS, 1);
+    }
 
     DataSource train_source = {0};
     if (!datasource_init(&train_source, config.train_record, config.train_limit,
@@ -1348,6 +1384,8 @@ int main(int argc, char **argv)
     printf("  train_limit:      %d\n", config.train_limit);
     printf("  val_limit:        %d\n", config.val_limit);
     printf("  test_limit:       %d\n", config.test_limit);
+    printf("  train_aug:        %s\n", config.enable_train_augment ? "yes" : "no");
+    printf("  eval_aug:         %s\n", config.enable_eval_augment ? "yes" : "no");
     printf("  train_source:     %s (%s)\n", config.train_record,
            datasource_kind_name(train_source.kind));
     if (config.val_record != NULL && strlen(config.val_record) > 0) {
@@ -1437,7 +1475,7 @@ int main(int argc, char **argv)
             for (int col = 0; col < current_batch; col++) {
                 int idx = train_indices[start + col];
                 if (!datasource_fill_column(&train_source, idx, batch_inputs, batch_targets,
-                                            col)) {
+                                            col, &train_aug)) {
                     fprintf(stderr, "Failed to load training sample %d.\n", idx);
                     ok = 0;
                     break;
@@ -1541,7 +1579,7 @@ int main(int argc, char **argv)
         if (have_val) {
             nn_set_training(nn, 0);
             evaluate_source(nn, &val_source, "validation", config.batch_size, batch_inputs,
-                            batch_targets, batch_predictions, &val_loss, &val_acc);
+                             batch_targets, batch_predictions, &eval_aug, &val_loss, &val_acc);
             nn_set_training(nn, 1);
         }
 
@@ -1579,20 +1617,21 @@ int main(int argc, char **argv)
     double final_train_loss = 0.0;
     double final_train_acc = 0.0;
     evaluate_source(nn, &train_source, "train", config.batch_size, batch_inputs, batch_targets,
-                    batch_predictions, &final_train_loss, &final_train_acc);
+                    batch_predictions, &eval_aug, &final_train_loss, &final_train_acc);
 
     double final_val_loss = 0.0;
     double final_val_acc = 0.0;
     if (datasource_sample_count(&val_source) > 0) {
         evaluate_source(nn, &val_source, "validation", config.batch_size, batch_inputs,
-                        batch_targets, batch_predictions, &final_val_loss, &final_val_acc);
+                        batch_targets, batch_predictions, &eval_aug, &final_val_loss,
+                        &final_val_acc);
     }
 
     double final_test_loss = 0.0;
     double final_test_acc = 0.0;
     if (datasource_sample_count(&test_source) > 0) {
         evaluate_source(nn, &test_source, "test", config.batch_size, batch_inputs,
-                        batch_targets, batch_predictions, &final_test_loss,
+                        batch_targets, batch_predictions, &eval_aug, &final_test_loss,
                         &final_test_acc);
     }
 
